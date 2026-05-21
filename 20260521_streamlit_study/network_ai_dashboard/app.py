@@ -10,12 +10,21 @@ from config.settings import (
     DEFAULT_REFRESH_SECONDS,
     REFRESH_OPTIONS,
 )
+
+from src.incident_manager import (
+    append_incident_log,
+    detect_incidents,
+    load_incident_log,
+)
+
 from src.ai_analyzer import analyze_without_llm
 from src.log_writer import append_system_log, load_system_log
 from src.network_connections import get_network_connections
 from src.rule_analyzer import analyze_system_risk, get_risk_label
 from src.session_summary import build_session_summary
 from src.system_monitor import bytes_to_mb, get_system_status
+from src.device_store import add_device, delete_device, load_devices
+from src.ping_monitor import append_ping_log, check_devices_status, load_ping_log
 
 
 def render_sidebar():
@@ -305,6 +314,483 @@ def render_system_detail(system_status, network_speed):
         hide_index=True,
     )
 
+def render_device_management_panel():
+    st.subheader("장비 목록 관리")
+
+    devices_df = load_devices()
+
+    with st.expander("장비 추가", expanded=False):
+        with st.form("device_add_form"):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                name = st.text_input(
+                    "장비명",
+                    placeholder="예: Core-Switch-01",
+                )
+
+                ip = st.text_input(
+                    "IP 주소",
+                    placeholder="예: 192.168.0.1",
+                )
+
+                role = st.selectbox(
+                    "장비 역할",
+                    [
+                        "Router",
+                        "Switch",
+                        "Firewall",
+                        "Server",
+                        "AP",
+                        "NAS",
+                        "Printer",
+                        "PC",
+                        "Other",
+                    ],
+                )
+
+                location = st.text_input(
+                    "위치",
+                    placeholder="예: 서버실 / 사무실 / 지점A",
+                )
+
+            with col2:
+                vendor = st.text_input(
+                    "벤더",
+                    placeholder="예: Cisco / Fortinet / HP / Dell",
+                )
+
+                snmp_enabled = st.checkbox(
+                    "SNMP 사용",
+                    value=False,
+                )
+
+                snmp_version = st.selectbox(
+                    "SNMP 버전",
+                    ["2c", "3"],
+                )
+
+                snmp_community = st.text_input(
+                    "SNMP Community",
+                    value="public",
+                    type="password",
+                )
+
+            description = st.text_area(
+                "설명",
+                placeholder="장비 설명 또는 비고를 입력하세요.",
+            )
+
+            submitted = st.form_submit_button("장비 등록")
+
+            if submitted:
+                success, message = add_device(
+                    name=name,
+                    ip=ip,
+                    role=role,
+                    location=location,
+                    vendor=vendor,
+                    snmp_enabled=snmp_enabled,
+                    snmp_version=snmp_version,
+                    snmp_community=snmp_community,
+                    description=description,
+                )
+
+                if success:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+    st.write("등록된 장비 목록")
+
+    if devices_df.empty:
+        st.info("아직 등록된 장비가 없습니다.")
+        return
+
+    display_df = devices_df.copy()
+
+    hidden_columns = ["device_id", "snmp_community"]
+
+    show_columns = [
+        column for column in display_df.columns if column not in hidden_columns
+    ]
+
+    st.dataframe(
+        display_df[show_columns],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("장비 삭제")
+
+    device_options = {
+        f"{row['name']} / {row['ip']} / {row['role']}": row["device_id"]
+        for _, row in devices_df.iterrows()
+    }
+
+    selected_label = st.selectbox(
+        "삭제할 장비 선택",
+        list(device_options.keys()),
+    )
+
+    if st.button("선택한 장비 삭제"):
+        selected_device_id = device_options[selected_label]
+
+        success, message = delete_device(selected_device_id)
+
+        if success:
+            st.success(message)
+            st.rerun()
+        else:
+            st.error(message)
+
+def render_device_ping_panel():
+    st.subheader("장비 Ping 상태 체크")
+
+    devices_df = load_devices()
+
+    if devices_df.empty:
+        st.info("등록된 장비가 없습니다. 먼저 장비 목록 관리에서 장비를 등록하세요.")
+        return
+
+    col1, col2 = st.columns([1, 3])
+
+    with col1:
+        timeout_ms = st.number_input(
+            "Ping 타임아웃(ms)",
+            min_value=500,
+            max_value=5000,
+            value=1000,
+            step=500,
+        )
+
+    with col2:
+        st.caption(
+            "등록된 장비 IP에 Ping을 보내 UP/DOWN 상태를 확인합니다. "
+            "현재 Ping 결과와 이전 Ping 로그를 비교해 장애 발생/복구 이력을 기록합니다."
+        )
+
+    if st.button("등록 장비 Ping 체크 실행"):
+        ping_df = check_devices_status(
+            devices_df=devices_df,
+            timeout_ms=int(timeout_ms),
+        )
+
+        incident_df = detect_incidents(ping_df)
+
+        if not incident_df.empty:
+            append_incident_log(incident_df)
+            st.session_state["last_incident_result"] = incident_df
+
+        append_ping_log(ping_df)
+
+        st.session_state["last_ping_result"] = ping_df
+
+        st.success("Ping 체크가 완료되었습니다.")
+
+        if not incident_df.empty:
+            st.warning(f"상태 변경 이벤트가 {len(incident_df)}건 감지되었습니다.")
+
+    ping_result_df = st.session_state.get("last_ping_result")
+
+    if ping_result_df is None or ping_result_df.empty:
+        st.info("아직 이번 세션에서 실행한 Ping 체크 결과가 없습니다.")
+    else:
+        up_count = len(ping_result_df[ping_result_df["status"] == "UP"])
+        down_count = len(ping_result_df[ping_result_df["status"] == "DOWN"])
+        unknown_count = len(ping_result_df[ping_result_df["status"] == "UNKNOWN"])
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric("전체 장비", len(ping_result_df))
+
+        with col2:
+            st.metric("UP", up_count)
+
+        with col3:
+            st.metric("DOWN", down_count)
+
+        with col4:
+            st.metric("UNKNOWN", unknown_count)
+
+        if down_count > 0:
+            st.error(f"DOWN 상태 장비가 {down_count}개 있습니다.")
+        else:
+            st.success("현재 Ping 기준 DOWN 장비가 없습니다.")
+
+        st.dataframe(
+            ping_result_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    last_incident_df = st.session_state.get("last_incident_result")
+
+    if last_incident_df is not None and not last_incident_df.empty:
+        st.write("이번 Ping 체크에서 감지된 상태 변경")
+        st.dataframe(
+            last_incident_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.write("최근 Ping 로그")
+
+    ping_log_df = load_ping_log(limit=100)
+
+    if ping_log_df.empty:
+        st.warning("저장된 Ping 로그가 없습니다.")
+        return
+
+    st.dataframe(
+        ping_log_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+def get_current_down_devices_from_ping_log(limit=1000):
+    """
+    최근 Ping 로그를 기준으로 장비별 최신 상태를 확인하고,
+    현재 devices.csv에 등록된 장비 중 DOWN 상태인 장비만 반환한다.
+    """
+    ping_log_df = load_ping_log(limit=limit)
+
+    if ping_log_df.empty:
+        return pd.DataFrame()
+
+    ping_log_df = filter_registered_devices_only(
+        ping_log_df,
+        device_id_column="device_id",
+    )
+
+    if ping_log_df.empty:
+        return pd.DataFrame()
+
+    required_columns = ["checked_at", "device_id", "name", "ip", "role", "location", "status"]
+
+    for column in required_columns:
+        if column not in ping_log_df.columns:
+            return pd.DataFrame()
+
+    df = ping_log_df.copy()
+
+    df["checked_at"] = pd.to_datetime(
+        df["checked_at"],
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=["checked_at"])
+    df = df.sort_values("checked_at")
+
+    latest_df = df.groupby("device_id").tail(1)
+
+    down_df = latest_df[latest_df["status"] == "DOWN"].copy()
+
+    if down_df.empty:
+        return pd.DataFrame()
+
+    return down_df.sort_values("checked_at", ascending=False)
+
+def filter_registered_devices_only(df, device_id_column="device_id"):
+    """
+    현재 devices.csv에 등록된 장비만 남긴다.
+    삭제된 장비의 과거 로그는 화면에 표시하지 않는다.
+    """
+    if df.empty:
+        return df
+
+    if device_id_column not in df.columns:
+        return df
+
+    devices_df = load_devices()
+
+    if devices_df.empty or "device_id" not in devices_df.columns:
+        return pd.DataFrame(columns=df.columns)
+
+    registered_device_ids = set(
+        devices_df["device_id"].astype(str).str.strip().tolist()
+    )
+
+    filtered_df = df.copy()
+    filtered_df[device_id_column] = filtered_df[device_id_column].astype(str).str.strip()
+
+    filtered_df = filtered_df[
+        filtered_df[device_id_column].isin(registered_device_ids)
+    ]
+
+    return filtered_df
+
+def render_global_alert_panel():
+    """
+    대시보드 상단에서 현재 장애 상태를 요약 경고로 표시한다.
+    """
+    down_devices_df = get_current_down_devices_from_ping_log(limit=1000)
+
+    if down_devices_df.empty:
+        st.success("현재 Ping 기준 DOWN 상태 장비가 없습니다.")
+        return
+
+    down_count = len(down_devices_df)
+
+    st.error(f"현재 DOWN 상태 장비가 {down_count}개 있습니다. 장애 이력과 Ping 상태를 확인하세요.")
+
+    with st.expander("현재 DOWN 장비 목록 보기", expanded=True):
+        st.dataframe(
+            down_devices_df[
+                [
+                    "checked_at",
+                    "name",
+                    "ip",
+                    "role",
+                    "location",
+                    "status",
+                    "error",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+def render_incident_panel():
+    st.subheader("장애 이력 관리")
+
+    incident_df = load_incident_log(limit=200)
+
+    incident_df = filter_registered_devices_only(
+    incident_df,
+    device_id_column="device_id",
+)
+    current_down_df = get_current_down_devices_from_ping_log(limit=1000)
+    
+    current_down_count = len(current_down_df) if not current_down_df.empty else 0
+
+    if incident_df.empty:
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("현재 DOWN 장비", current_down_count)
+
+        with col2:
+            st.metric("장애 발생 이력", 0)
+
+        with col3:
+            st.metric("복구 이력", 0)
+
+        if current_down_count > 0:
+            st.error(f"현재 DOWN 상태 장비가 {current_down_count}개 있습니다.")
+            st.dataframe(
+                current_down_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("아직 저장된 장애 이력이 없습니다.")
+
+        return
+
+    down_count = len(incident_df[incident_df["event_type"] == "DOWN"])
+    recovered_count = len(incident_df[incident_df["event_type"] == "RECOVERED"])
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric("현재 DOWN 장비", current_down_count)
+
+    with col2:
+        st.metric("전체 이벤트", len(incident_df))
+
+    with col3:
+        st.metric("장애 발생", down_count)
+
+    with col4:
+        st.metric("복구", recovered_count)
+
+    if current_down_count > 0:
+        st.error(f"현재 장애 상태 장비가 {current_down_count}개 있습니다.")
+        with st.expander("현재 DOWN 장비 상세", expanded=True):
+            st.dataframe(
+                current_down_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.success("현재 Ping 기준 DOWN 상태 장비가 없습니다.")
+
+    event_filter = st.multiselect(
+        "이벤트 유형 필터",
+        ["DOWN", "RECOVERED"],
+        default=["DOWN", "RECOVERED"],
+    )
+
+    filtered_df = incident_df[incident_df["event_type"].isin(event_filter)].copy()
+
+    if filtered_df.empty:
+        st.warning("선택한 조건에 해당하는 장애 이력이 없습니다.")
+        return
+
+    filtered_df["event_time"] = pd.to_datetime(
+        filtered_df["event_time"],
+        errors="coerce",
+    )
+
+    filtered_df = filtered_df.sort_values(
+        "event_time",
+        ascending=False,
+    )
+
+    down_events_df = filtered_df[filtered_df["event_type"] == "DOWN"]
+    recovered_events_df = filtered_df[filtered_df["event_type"] == "RECOVERED"]
+
+    tab1, tab2, tab3 = st.tabs(
+        [
+            "전체 이벤트",
+            "장애 발생",
+            "복구",
+        ]
+    )
+
+    with tab1:
+        st.dataframe(
+            filtered_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tab2:
+        if down_events_df.empty:
+            st.success("선택한 조건에서 장애 발생 이벤트가 없습니다.")
+        else:
+            st.error(f"장애 발생 이벤트 {len(down_events_df)}건")
+            st.dataframe(
+                down_events_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab3:
+        if recovered_events_df.empty:
+            st.info("선택한 조건에서 복구 이벤트가 없습니다.")
+        else:
+            st.success(f"복구 이벤트 {len(recovered_events_df)}건")
+            st.dataframe(
+                recovered_events_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    csv_data = filtered_df.to_csv(
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    st.download_button(
+        label="장애 이력 CSV 다운로드",
+        data=csv_data,
+        file_name="incident_log.csv",
+        mime="text/csv",
+    )
 
 def render_network_connections(connections_df, show_listen, max_rows):
     st.subheader("현재 네트워크 연결 세션")
@@ -705,6 +1191,10 @@ def main():
 
     apply_auto_refresh(auto_refresh, refresh_seconds)
 
+    render_global_alert_panel()
+
+    st.divider()
+
     render_header(auto_refresh, refresh_seconds)
 
     system_status = get_system_status()
@@ -733,6 +1223,18 @@ def main():
     st.divider()
 
     render_session_summary(session_summary)
+
+    st.divider()
+
+    render_device_management_panel()
+
+    st.divider()
+
+    render_device_ping_panel()
+
+    st.divider()
+
+    render_incident_panel()
 
     st.divider()
 
