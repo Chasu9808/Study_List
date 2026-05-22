@@ -20,4 +20,5 @@ dependencies = [
 members = [
     "20260521_streamlit_study/my-dashboard",
     "20260521_streamlit_study",
+    "20260522_streamlit_study2",
 ]
